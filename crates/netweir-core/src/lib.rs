@@ -6,7 +6,8 @@
 
 // Unsafe code only with the http3 feature: in src/h3.rs, which sets NSS
 // up as Firefox does over its C API, and src/https_rr.rs, which asks the
-// system's resolver for HTTPS records as Firefox does.
+// system's resolver for HTTPS records as Firefox does. src/h3_chrome.rs has
+// none.
 #![cfg_attr(not(feature = "http3"), forbid(unsafe_code))]
 #![cfg_attr(feature = "http3", deny(unsafe_code))]
 
@@ -22,6 +23,8 @@ pub mod deltafetch;
 mod fetch;
 #[cfg(feature = "http3")]
 mod h3;
+#[cfg(feature = "http3")]
+mod h3_chrome;
 #[cfg(feature = "http3")]
 mod https_rr;
 pub mod install;

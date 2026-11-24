@@ -384,8 +384,18 @@ impl Trust {
 
     /// Whether `chain` (leaf first, DER) is good for `host`.
     fn check(&self, host: &str, chain: &[Vec<u8>]) -> AuthenticationStatus {
+        if self.trusts(host, chain) {
+            AuthenticationStatus::Ok
+        } else {
+            AuthenticationStatus::CertUntrusted
+        }
+    }
+
+    /// Whether `chain` (leaf first, DER) is good for `host`, checked with
+    /// BoringSSL against the roots the TCP connections use.
+    pub(crate) fn trusts(&self, host: &str, chain: &[Vec<u8>]) -> bool {
         let Trust::Roots(store) = self else {
-            return AuthenticationStatus::Ok;
+            return true;
         };
         let check = || -> Result<bool, btls::error::ErrorStack> {
             let leaf = X509::from_der(chain.first().map_or(&[][..], Vec::as_slice))?;
@@ -403,10 +413,7 @@ impl Trust {
                 ctx.verify_cert()
             })
         };
-        match check() {
-            Ok(true) => AuthenticationStatus::Ok,
-            _ => AuthenticationStatus::CertUntrusted,
-        }
+        matches!(check(), Ok(true))
     }
 }
 
@@ -442,13 +449,26 @@ fn priority(headers: &[(String, Vec<u8>)]) -> Priority {
     Priority::new(urgency, incremental)
 }
 
-type Chunk = Result<Bytes, io::Error>;
+pub(crate) type Chunk = Result<Bytes, io::Error>;
 
 /// A response body as it arrives on its stream, until the request's
 /// deadline.
 pub(crate) struct Body {
     chunks: mpsc::UnboundedReceiver<Chunk>,
     deadline: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl Body {
+    /// A body whose chunks come from `chunks`, until `deadline`.
+    pub(crate) fn new(
+        chunks: mpsc::UnboundedReceiver<Chunk>,
+        deadline: tokio::time::Instant,
+    ) -> Body {
+        Body {
+            chunks,
+            deadline: Box::pin(tokio::time::sleep_until(deadline)),
+        }
+    }
 }
 
 impl HttpBody for Body {
@@ -508,15 +528,15 @@ pub(crate) async fn decompressed(
 }
 
 /// What the connection's thread needs to send a request and answer it.
-struct Job {
-    request: Request,
-    head: oneshot::Sender<Result<http::Response<Body>, FetchError>>,
-    deadline: tokio::time::Instant,
+pub(crate) struct Job {
+    pub request: Request,
+    pub head: oneshot::Sender<Result<http::Response<Body>, FetchError>>,
+    pub deadline: tokio::time::Instant,
 }
 
 /// How far an HTTP/3 connection has got.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum State {
+pub(crate) enum State {
     Connecting,
     Connected,
     /// It never connected. Firefox stops using HTTP/3 to the alternative's
@@ -537,14 +557,14 @@ enum State {
 
 /// An open HTTP/3 connection, or one opening.
 #[derive(Clone)]
-struct Handle {
-    jobs: mpsc::UnboundedSender<Job>,
-    thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
-    state: watch::Receiver<State>,
+pub(crate) struct Handle {
+    pub jobs: mpsc::UnboundedSender<Job>,
+    pub thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+    pub state: watch::Receiver<State>,
 }
 
 impl Handle {
-    fn usable(&self) -> bool {
+    pub(crate) fn usable(&self) -> bool {
         !self.jobs.is_closed()
             && matches!(*self.state.borrow(), State::Connecting | State::Connected)
     }
@@ -686,7 +706,7 @@ fn settled(known: &mut Alternative, to: &str, ok: bool) {
 }
 
 /// The host part of an alternative's `host:port`.
-fn host_of(alternative: &str) -> &str {
+pub(crate) fn host_of(alternative: &str) -> &str {
     alternative
         .rsplit_once(':')
         .map_or(alternative, |(host, _)| host)
@@ -727,9 +747,20 @@ impl Pending {
     }
 }
 
+/// Whose QUIC and HTTP/3 a Fetcher sends, and whose rules it follows to
+/// move to it and off it.
+pub(crate) enum Stack {
+    /// Firefox 160: neqo and NSS (this file).
+    Firefox,
+    /// Chrome 157: netweir's quiche on btls (src/h3_chrome.rs), with the
+    /// profile's TLS settings.
+    Chrome(Arc<crate::profile::Tls>),
+}
+
 /// Where each origin's requests go over HTTP/3, and the connections to
 /// them, shared by every clone of a Fetcher.
 pub(crate) struct Routes {
+    stack: Stack,
     trust: Trust,
     /// Each origin's alternative, by network partition (the request's
     /// top-level site) and origin (`https://host:port`), as Firefox keys
@@ -754,9 +785,29 @@ pub(crate) struct Routes {
     /// connection to it, as Firefox's SSLTokensCache keeps them. Each is
     /// used once.
     tickets: Tickets,
+    /// The same for Chrome's connections, with each server's RTT.
+    chrome_tickets: crate::h3_chrome::Tickets,
+    /// Chrome's: each origin's Alt-Svc entries, by partition and origin,
+    /// in the header's order, with when each expires
+    /// (HttpServerProperties::SetAlternativeServices).
+    chrome_alternatives: Mutex<HashMap<(String, String), ChromeAlternatives>>,
+    /// Chrome's broken and recently broken alternatives, by partition and
+    /// `host:port` (BrokenAlternativeServices).
+    broken: Mutex<HashMap<(String, String), crate::h3_chrome::Broken>>,
+    /// Alternatives whose race the TCP job won while their QUIC job was
+    /// still connecting: broken if that one then fails
+    /// (JobController::MaybeReportBrokenAlternativeService).
+    main_won: Mutex<HashSet<(String, String)>>,
+    /// Whether a QUIC connection has come up yet, which Chrome waits for
+    /// before it delays a TCP job behind one
+    /// (QuicSessionPool::has_quic_ever_worked_on_current_network_).
+    quic_worked: std::sync::atomic::AtomicBool,
 }
 
 type Tickets = Arc<Mutex<HashMap<String, ResumptionToken>>>;
+
+/// An origin's Alt-Svc entries as Chrome keeps them, each with its expiry.
+type ChromeAlternatives = Vec<(crate::h3_chrome::AltSvc, Instant)>;
 
 impl Routes {
     pub(crate) fn new(
@@ -764,8 +815,10 @@ impl Routes {
         validate: Validate,
         hosts: Arc<HashMap<String, Vec<IpAddr>>>,
         seam: Option<Arc<crate::https_rr::Seam>>,
+        stack: Stack,
     ) -> Routes {
         Routes {
+            stack,
             trust,
             alternatives: Mutex::default(),
             excluded: Mutex::default(),
@@ -775,7 +828,208 @@ impl Routes {
             seam,
             connections: Mutex::default(),
             tickets: Tickets::default(),
+            chrome_tickets: crate::h3_chrome::Tickets::default(),
+            chrome_alternatives: Mutex::default(),
+            broken: Mutex::default(),
+            main_won: Mutex::default(),
+            quic_worked: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    fn is_chrome(&self) -> bool {
+        matches!(self.stack, Stack::Chrome(_))
+    }
+
+    /// Chrome's half of `learn` (HttpNetworkTransaction::ProcessAltSvcHeader,
+    /// HttpStreamFactory::ProcessAlternativeServices): a header Chrome
+    /// can't parse changes nothing; one it can replaces the origin's whole
+    /// list with its `h3` and `h2` entries, `h3-29` and the like left out;
+    /// `clear`, or a list left empty, forgets them.
+    fn learn_chrome(&self, partition: &str, origin: &Url, header: &str) {
+        let Some(entries) = crate::h3_chrome::parse_alt_svc(header) else {
+            return;
+        };
+        let key = (partition.to_string(), origin.origin().ascii_serialization());
+        let forced = (key.0.clone(), key.1.clone(), true);
+        if self
+            .alternatives
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&forced)
+            .is_some_and(|a| a.forced)
+        {
+            return;
+        }
+        let now = Instant::now();
+        let kept: Vec<_> = entries
+            .into_iter()
+            .filter(|e| e.protocol == "h3" || e.protocol == "h2")
+            .map(|e| {
+                let expires = now + Duration::from_secs(u64::from(e.max_age));
+                (e, expires)
+            })
+            .collect();
+        let mut all = self
+            .chrome_alternatives
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if kept.is_empty() {
+            all.remove(&key);
+        } else {
+            all.insert(key, kept);
+        }
+    }
+
+    /// Chrome's half of `alternative`
+    /// (JobController::GetAdvertisedAltSvcInternal): the first `h3` entry
+    /// that hasn't expired, isn't broken, isn't on a port Chrome refuses
+    /// or a high port for a low one; or, before it, any whose connection
+    /// is already up. An expired broken mark takes its alternative out of
+    /// every origin's list in the partition, which then needs a new
+    /// Alt-Svc (HttpServerProperties::OnExpireBrokenAlternativeService).
+    fn alternative_chrome(&self, partition: &str, origin: &str) -> Option<Route> {
+        let now = Instant::now();
+        let url = Url::parse(origin).ok()?;
+        let (host, port) = (url.host_str()?.to_string(), url.port_or_known_default()?);
+        let mut all = self
+            .chrome_alternatives
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        {
+            let mut broken = self.broken.lock().unwrap_or_else(|e| e.into_inner());
+            for ((p, to), b) in broken.iter_mut() {
+                if p == partition && b.until.is_some_and(|u| u <= now) {
+                    b.until = None;
+                    for ((q, o), list) in all.iter_mut() {
+                        if q == partition {
+                            let origin_host = Url::parse(o)
+                                .ok()
+                                .and_then(|u| u.host_str().map(str::to_string))
+                                .unwrap_or_default();
+                            list.retain(|(e, _)| {
+                                let h = if e.host.is_empty() {
+                                    &origin_host
+                                } else {
+                                    &e.host
+                                };
+                                format!("{h}:{}", e.port) != *to
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        let key = (partition.to_string(), origin.to_string());
+        let list = all.get_mut(&key)?;
+        list.retain(|(_, expires)| now < *expires);
+        let broken = self.broken.lock().unwrap_or_else(|e| e.into_inner());
+        let connections = self.connections.lock().unwrap_or_else(|e| e.into_inner());
+        let mut chosen = None;
+        for (e, _) in list.iter().filter(|(e, _)| e.protocol == "h3") {
+            let to_host = if e.host.is_empty() {
+                host.as_str()
+            } else {
+                e.host.as_str()
+            };
+            let to = format!("{to_host}:{}", e.port);
+            if broken
+                .get(&(partition.to_string(), to.clone()))
+                .is_some_and(|b| b.is_broken(now))
+                || crate::h3_chrome::RESTRICTED_PORTS.contains(&e.port)
+                || (e.port >= 1024 && port < 1024)
+            {
+                continue;
+            }
+            let up = connections
+                .get(&format!("{partition} {host} {to}"))
+                .is_some_and(|h| h.usable() && *h.state.borrow() == State::Connected);
+            if up {
+                chosen = Some(to);
+                break;
+            }
+            chosen.get_or_insert(to);
+        }
+        chosen.map(|alternative| Route {
+            partition: partition.to_string(),
+            alternative,
+            forced: false,
+            h3: true,
+            record: None,
+        })
+    }
+
+    /// Chrome's main-job delay for a request to `alternative`.
+    fn chrome_delay(&self, partition: &str, host: &str, alternative: &str) -> Duration {
+        let worked = self.quic_worked.load(std::sync::atomic::Ordering::Relaxed);
+        let recently = self
+            .broken
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(partition.to_string(), alternative.to_string()))
+            .is_some_and(|b| b.until.is_some() || b.count > 0);
+        let rtt = self
+            .chrome_tickets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&format!("{partition} {host} {alternative}"))
+            .map(|t| t.rtt);
+        crate::h3_chrome::main_job_delay(worked, recently, rtt)
+    }
+
+    /// Marks `alternative` broken in `partition`
+    /// (HttpServerProperties::MarkAlternativeServiceBroken).
+    fn mark_broken(&self, partition: &str, alternative: &str) {
+        self.broken
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry((partition.to_string(), alternative.to_string()))
+            .or_default()
+            .mark(Instant::now());
+    }
+
+    /// A request routed to `route` was answered over TCP instead: for
+    /// Chrome, the TCP job succeeded, which makes a QUIC job that failed
+    /// (or fails later) to the same alternative broken
+    /// (JobController::MaybeReportBrokenAlternativeService), as does a
+    /// retry over TCP after a QUIC error
+    /// (HttpNetworkTransaction::HandleIOError, `retried_alternative_service_`).
+    pub(crate) fn tcp_answered(&self, route: &Route, host: &str) {
+        if !self.is_chrome() || route.forced {
+            return;
+        }
+        let key = format!("{} {host} {}", route.partition, route.alternative);
+        let state = self
+            .connections
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .map(|h| *h.state.borrow());
+        match state {
+            Some(State::Failed { .. } | State::Broken) => {
+                self.mark_broken(&route.partition, &route.alternative)
+            }
+            Some(State::Connecting) => {
+                self.main_won
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert((route.partition.clone(), route.alternative.clone()));
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether a response with `status` is read for Alt-Svc: Firefox
+    /// skips a 421 and any 5xx (nsHttpChannel::ProcessAltService); Chrome
+    /// reads every final response but a 421, which it sends again
+    /// instead (HttpNetworkTransaction::DoReadHeadersComplete).
+    pub(crate) fn learns_from(&self, status: u16) -> bool {
+        status != 421 && (self.is_chrome() || status < 500)
+    }
+
+    /// Whether requests over HTTP/3 carry `Alt-Used`, as Firefox's do
+    /// and Chrome's don't.
+    pub(crate) fn alt_used(&self) -> bool {
+        matches!(self.stack, Stack::Firefox)
     }
 
     fn excluded(&self, host: &str) -> bool {
@@ -810,6 +1064,9 @@ impl Routes {
     /// connection is made to it, and the origin's requests use it once
     /// that is up.
     pub(crate) fn learn(self: &Arc<Self>, partition: &str, origin: &Url, header: &str) {
+        if self.is_chrome() {
+            return self.learn_chrome(partition, origin, header);
+        }
         let (Some(host), Some(port)) = (origin.host_str(), origin.port_or_known_default()) else {
             return;
         };
@@ -1038,6 +1295,15 @@ impl Routes {
     /// reach (AltSvcCache::LookupMapping).
     pub(crate) fn alternative(&self, partition: &str, origin: &str) -> Option<Route> {
         let mut alternatives = self.alternatives.lock().unwrap_or_else(|e| e.into_inner());
+        let forced = |h3: bool| {
+            alternatives
+                .get(&(partition.to_string(), origin.to_string(), h3))
+                .is_some_and(|a| a.forced)
+        };
+        if self.is_chrome() && !forced(true) && !forced(false) {
+            drop(alternatives);
+            return self.alternative_chrome(partition, origin);
+        }
         // HTTP/3 first, then HTTP/2 (AltSvcCache::GetAltServiceMapping).
         for h3 in [true, false] {
             let key = (partition.to_string(), origin.to_string(), h3);
@@ -1125,15 +1391,28 @@ impl Routes {
             .hosts
             .get(host_of(alternative))
             .and_then(|a| a.first().copied());
-        let handle = open(
-            host,
-            alternative,
-            given,
-            ech.map(<[u8]>::to_vec),
-            &key,
-            self.trust.clone(),
-            &self.tickets,
-        );
+        let handle = match &self.stack {
+            Stack::Firefox => open(
+                host,
+                alternative,
+                given,
+                ech.map(<[u8]>::to_vec),
+                &key,
+                self.trust.clone(),
+                &self.tickets,
+            ),
+            // Chrome: no ECH configuration from an HTTPS record (Netweir
+            // never routes a Chrome request by one).
+            Stack::Chrome(tls) => crate::h3_chrome::open(
+                host,
+                alternative,
+                given,
+                &key,
+                tls.clone(),
+                self.trust.clone(),
+                &self.chrome_tickets,
+            ),
+        };
         connections.insert(key, handle.clone());
         let (routes, mut state) = (Arc::downgrade(self), handle.state.clone());
         let (partition, host, alternative) = (
@@ -1149,6 +1428,31 @@ impl Routes {
             let Some(now) = Weak::upgrade(&routes) else {
                 return;
             };
+            // Chrome: a handshake confirms the alternative, forgetting
+            // that it was ever broken (QuicSessionPool::
+            // ProcessGoingAwaySession, ConfirmAlternativeService); a job
+            // that fails after the TCP one won makes it broken.
+            if now.is_chrome() {
+                let key = (partition.clone(), alternative.clone());
+                let won = now
+                    .main_won
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&key);
+                match outcome {
+                    State::Connected => {
+                        now.quic_worked
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        now.broken
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&key);
+                    }
+                    State::Failed { .. } if won => now.mark_broken(&partition, &alternative),
+                    _ => {}
+                }
+                return;
+            }
             match outcome {
                 State::Connected => now.proved(&partition, &host, &alternative),
                 State::Failed { exclude } => return now.failed(&alternative, exclude),
@@ -1209,9 +1513,12 @@ impl Routes {
         let ech = route.record.as_ref().and_then(Option::as_deref);
         let handle = self.connection(&route.partition, host, alternative, ech);
         let mut state = handle.state.clone();
-        // A route from an HTTPS record races TCP sooner
+        // How long the request waits for a connection still coming up
+        // before TCP races it: Chrome's main-job delay; Firefox's backup
+        // timer, sooner for a route from an HTTPS record
         // (nsHttpTransaction::OnFastFallbackTimer).
         let timer = match route.record {
+            _ if self.is_chrome() => self.chrome_delay(&route.partition, host, alternative),
             Some(_) => firefox::FAST_FALLBACK,
             None => firefox::BACKUP_TIMER,
         };
@@ -1244,8 +1551,12 @@ impl Routes {
         };
         // A request safe to repeat that got nothing back goes again over
         // TCP when the connection went under it (nsHttpTransaction::Close).
+        // Chrome sends any request again over TCP after a QUIC error that
+        // came before its response (HttpNetworkTransaction::HandleIOError,
+        // for every method).
+        let chrome = self.is_chrome();
         let repeat = |e: FetchError| {
-            if idempotent && !route.forced {
+            if (idempotent || chrome) && !route.forced {
                 Ok(Answer::Tcp)
             } else {
                 Err(e)
@@ -1291,7 +1602,7 @@ fn protocol_error(reason: &neqo_transport::CloseReason) -> bool {
 /// An `Alt-Svc` value as Firefox's ParsedHeaderValueListList reads it:
 /// alternatives split at commas, each into `name=value` pairs split at
 /// semicolons, outside quotes, with the quotes taken off.
-fn alt_svc(header: &str) -> Vec<Vec<(String, String)>> {
+pub(crate) fn alt_svc(header: &str) -> Vec<Vec<(String, String)>> {
     let mut entries = vec![Vec::new()];
     let mut pair = (String::new(), String::new());
     let (mut quoted, mut in_value) = (false, false);
@@ -1324,7 +1635,7 @@ fn alt_svc(header: &str) -> Vec<Vec<(String, String)>> {
 }
 
 /// The number `s` starts with, as C's atoi reads it.
-fn leading_number(s: &str) -> i64 {
+pub(crate) fn leading_number(s: &str) -> i64 {
     let s = s.trim_start();
     let (sign, digits) = match s.strip_prefix('-') {
         Some(rest) => (-1, rest),
@@ -1404,7 +1715,7 @@ fn open(
     }
 }
 
-fn fail_all(mut queue: mpsc::UnboundedReceiver<Job>, why: &str) {
+pub(crate) fn fail_all(mut queue: mpsc::UnboundedReceiver<Job>, why: &str) {
     queue.close();
     while let Ok(job) = queue.try_recv() {
         let _ = job.head.send(Err(FetchError::new(

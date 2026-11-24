@@ -626,6 +626,65 @@ pub(crate) struct Route {
     /// From an HTTPS record, with its ECH configuration if it has one:
     /// used without proving it, and without Alt-Used.
     pub record: Option<Option<Vec<u8>>>,
+    /// The records a route from an HTTPS record came from, for where its
+    /// TCP connection goes (Firefox's routes only).
+    pub from: Option<Arc<FromRecords>>,
+}
+
+/// The HTTPS records a request's route came from, and its origin: where
+/// its TCP connections go when they don't go to the origin.
+pub(crate) struct FromRecords {
+    found: Found,
+    host: String,
+    port: u16,
+    /// For a request over TCP, the record it goes to
+    /// (nsHttpConnectionInfo::CloneAndAdoptHTTPSSVCRecord).
+    pub tcp: Option<crate::https_rr::Route>,
+}
+
+impl FromRecords {
+    /// Where a fast fallback's TCP connection goes, for an HTTP/3 route
+    /// that `ech_used` or not (nsHttpTransaction::PrepareFastFallbackConnInfo):
+    /// the best record without h3, which has to have ECH if the HTTP/3 one
+    /// did. `Some(None)` is the origin; None is no fallback connection at
+    /// all, when ECH was used and no record without h3 has it.
+    pub(crate) fn fast_fallback(&self, ech_used: bool) -> Option<Option<crate::https_rr::Route>> {
+        let records = self.found.records.as_ref()?;
+        let tcp = crate::https_rr::choose_tcp(
+            records,
+            &self.host,
+            self.port,
+            self.found.cname.as_deref(),
+        )
+        .filter(|r| !ech_used || r.ech.is_some());
+        match tcp {
+            Some(r) => Some(Some(r)),
+            None if ech_used => None,
+            None => Some(None),
+        }
+    }
+
+    /// The records a request goes on to after a connection with ECH
+    /// failed, and whether every record has ECH
+    /// (nsHttpTransaction::PrepareSVCBRecordsForRetry): those after the
+    /// failed one, in order, but none to the same target with the same
+    /// ALPN.
+    pub(crate) fn retries(
+        &self,
+        failed: &crate::https_rr::Route,
+    ) -> (bool, Vec<crate::https_rr::Route>) {
+        let Some(records) = self.found.records.as_ref() else {
+            return (false, Vec::new());
+        };
+        let (all, mut list) = crate::https_rr::all_with_ech(
+            records,
+            &self.host,
+            self.port,
+            self.found.cname.as_deref(),
+        );
+        list.retain(|r| r.host != failed.host || r.alpn != failed.alpn);
+        (all, list)
+    }
 }
 
 /// What an origin's HTTPS records came to, once its lookup is done: the
@@ -806,6 +865,8 @@ pub(crate) struct Routes {
     records: Mutex<HashMap<String, watch::Receiver<Option<Found>>>>,
     /// Given answers to HTTPS queries, for tests.
     seam: Option<Arc<crate::https_rr::Seam>>,
+    /// Firefox's host cache, which the TCP connections' lookups share.
+    host_cache: Option<Arc<crate::https_rr::HostCache>>,
     /// Connections by partition, server name and alternative.
     connections: Mutex<HashMap<String, Handle>>,
     /// The newest session ticket from each server, for the next
@@ -846,6 +907,7 @@ impl Routes {
         hosts: Arc<HashMap<String, Vec<IpAddr>>>,
         seam: Option<Arc<crate::https_rr::Seam>>,
         stack: Stack,
+        host_cache: Option<Arc<crate::https_rr::HostCache>>,
     ) -> Routes {
         Routes {
             stack,
@@ -856,6 +918,7 @@ impl Routes {
             hosts,
             records: Mutex::default(),
             seam,
+            host_cache,
             connections: Mutex::default(),
             tickets: Tickets::default(),
             chrome_tickets: crate::h3_chrome::Tickets::default(),
@@ -867,9 +930,17 @@ impl Routes {
         }
     }
 
+    /// How many address lookups Firefox's host cache has started.
+    #[cfg(test)]
+    pub(crate) fn address_lookups(&self) -> usize {
+        self.host_cache
+            .as_ref()
+            .map_or(0, |c| c.lookups.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     /// Whether the Fetcher follows Chrome's rules, as Safari's profiles
     /// also do, with the exceptions `is_safari` marks.
-    fn is_chrome(&self) -> bool {
+    pub(crate) fn is_chrome(&self) -> bool {
         matches!(self.stack, Stack::Chrome(_) | Stack::Safari(_))
     }
 
@@ -992,6 +1063,7 @@ impl Routes {
             forced: false,
             h3: true,
             record: None,
+            from: None,
         })
     }
 
@@ -1210,11 +1282,6 @@ impl Routes {
             if !(is_h3 && !self.excluded(to_host) || protocol == "h2") {
                 continue;
             }
-            // Known limit: wreq connects to the port a URL gives, so an
-            // origin with one can't have its HTTP/2 sent to another.
-            if !is_h3 && origin.port().is_some_and(|p| p != to_port) {
-                continue;
-            }
             let max_age = parameters
                 .iter()
                 .rev()
@@ -1331,14 +1398,23 @@ impl Routes {
                 let (host, seam) = (host.to_string(), self.seam.clone());
                 let chrome = self.alt_svc_first();
                 let given = self.hosts.contains_key(&host);
+                let cache = self.host_cache.clone();
                 tokio::spawn(async move {
+                    // The canonical name comes from the address lookup the
+                    // connection uses too, Firefox's host cache entry
+                    // (network.dns.always_ai_canonname). A name given an
+                    // address has none.
+                    let cname = async {
+                        match &cache {
+                            _ if given => None,
+                            Some(cache) => cache.lookup(&host).await?.cname.clone(),
+                            None => crate::https_rr::canonical_name(&host).await,
+                        }
+                    };
                     let (records, cname) = if chrome {
                         chrome_resolve(&host, port, seam.as_deref(), given).await
                     } else {
-                        tokio::join!(
-                            crate::https_rr::query(&host, port, seam.as_deref()),
-                            crate::https_rr::canonical_name(&host),
-                        )
+                        tokio::join!(crate::https_rr::query(&host, port, seam.as_deref()), cname)
                     };
                     let expires = Instant::now()
                         + match (&records, chrome) {
@@ -1372,13 +1448,12 @@ impl Routes {
         })
     }
 
-    /// Where `lookup`'s records send a request, once they're in: over
-    /// HTTP/3 to the record Firefox picks (HTTPSSVC.cpp
-    /// GetServiceModeRecordWithCname, nsHttpConnectionInfo::
-    /// CloneAndAdoptHTTPSSVCRecord) when that one offers h3. None: no
-    /// record, or none for HTTP/3.
-    // Known limit: a record that sends TCP elsewhere (another port, or
-    // ECH over TCP) isn't followed; the request goes to the origin.
+    /// Where `lookup`'s records send a request, once they're in: to the
+    /// record Firefox picks (HTTPSSVC.cpp GetServiceModeRecordWithCname,
+    /// nsHttpConnectionInfo::CloneAndAdoptHTTPSSVCRecord), over HTTP/3
+    /// when that one offers h3, else over TCP to its target and port,
+    /// with its ECH configuration. None: no record, or one that changes
+    /// nothing, the origin itself with no ECH and no ALPN of its own.
     fn adopt(&self, lookup: &Lookup, found: &Found) -> Option<Route> {
         let records = found.records.as_ref()?;
         let (host, port) = (
@@ -1403,18 +1478,38 @@ impl Routes {
                 forced: false,
                 h3: true,
                 record: Some(ech),
+                from: None,
             });
         }
         let chosen =
             crate::https_rr::choose(records, host, port, found.cname.as_deref(), &|target| {
                 self.excluded(target)
             })?;
-        (chosen.alpn == "h3" && chosen.port != 0).then(|| Route {
+        let h3 = chosen.alpn == "h3";
+        // Chrome's and Safari's TCP connections stay with the origin.
+        if !h3 && self.is_chrome() {
+            return None;
+        }
+        let nothing_new = !h3
+            && chosen.host.eq_ignore_ascii_case(host)
+            && chosen.port == port
+            && chosen.ech.is_none()
+            && chosen.alpn.is_empty();
+        if chosen.port == 0 || nothing_new {
+            return None;
+        }
+        Some(Route {
             partition: lookup.partition.clone(),
             alternative: format!("{}:{}", chosen.host, chosen.port),
             forced: false,
-            h3: true,
-            record: Some(chosen.ech),
+            h3,
+            record: Some(chosen.ech.clone()),
+            from: Some(Arc::new(FromRecords {
+                found: found.clone(),
+                host: host.to_string(),
+                port,
+                tcp: (!h3).then_some(chosen),
+            })),
         })
     }
 
@@ -1465,6 +1560,7 @@ impl Routes {
                     forced: known.forced,
                     h3,
                     record: None,
+                    from: None,
                 });
             }
         }
@@ -1543,6 +1639,7 @@ impl Routes {
                 &key,
                 self.trust.clone(),
                 &self.tickets,
+                self.host_cache.clone(),
             ),
             Stack::Chrome(tls) => crate::h3_chrome::open(
                 host,
@@ -1858,6 +1955,7 @@ pub(crate) fn leading_number(s: &str) -> i64 {
 
 /// Opens a connection to `alternative`, at the address `given` for its
 /// host if there is one.
+#[allow(clippy::too_many_arguments, reason = "each is the connection's own")]
 fn open(
     host: &str,
     alternative: &str,
@@ -1866,6 +1964,7 @@ fn open(
     key: &str,
     trust: Trust,
     tickets: &Tickets,
+    host_cache: Option<Arc<crate::https_rr::HostCache>>,
 ) -> Handle {
     let (jobs, queue) = mpsc::unbounded_channel();
     let (state, watching) = watch::channel(State::Connecting);
@@ -1893,6 +1992,17 @@ fn open(
                 key,
                 tickets,
             };
+            // The alternative's address, from Firefox's host cache as the
+            // TCP connections' are.
+            let given = given.or_else(|| {
+                let cache = host_cache.as_ref()?;
+                let name = host_of(&alternative);
+                if name.trim_matches(['[', ']']).parse::<IpAddr>().is_ok() {
+                    return None;
+                }
+                let answer = runtime.block_on(cache.lookup(name))?;
+                answer.ips.first().copied()
+            });
             runtime.block_on(run(
                 host,
                 alternative,

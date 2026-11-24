@@ -128,17 +128,40 @@ default preferences; Chrome's rules are
   `.local`, a name in the hosts file or under a search domain. An http URL
   is asked about too, as Firefox's DNS prefetch asks. Alongside goes an
   address lookup for the canonical name, which a record's target has to
-  match (`network.dns.https_rr.check_record_with_cname`). The answer is
+  match (`network.dns.https_rr.check_record_with_cname`). It's the same
+  lookup the connections use: `network.dns.always_ai_canonname` makes
+  every address lookup getaddrinfo with `AI_CANONNAME`, as NSPR calls it
+  on Linux, macOS and Windows alike, and the host cache keeps one entry
+  for both, for `network.dnsCacheExpiration` (60 s, or the TTL on
+  Windows, which a second lookup asks `DnsQuery_A` for, as
+  `network.dns.get-ttl` has Firefox do there), then serves it for
+  `network.dnsCacheExpirationGracePeriod` (600 s) while it looks the name
+  up again; a failed lookup is kept the same way. The answer is
   parsed, sorted and picked as `DNSPacket`, `HTTPSSVC.cpp` and
   `GetServiceModeRecordWithCname` do (`src/https_rr.rs`), and kept for
   its TTL and then the 600 s grace, or 300 s if there was none. The
   request doesn't wait for it: one whose TCP connection is still being
-  made when a record offering h3 comes in moves to HTTP/3, as a
+  made when a record comes in takes the record's route, as a
   transaction not yet on a connection does
-  (`nsHttpTransaction::OnHTTPSRRAvailable`), and later requests use the
-  record at once. The route isn't proved first, carries no `Alt-Used`,
-  takes the record's ECH configuration in place of ECH GREASE, and races
-  TCP after `network.dns.httpssvc.http3_fast_fallback_timeout`, 50 ms. An
+  (`nsHttpTransaction::OnHTTPSRRAvailable`), the connection going on to
+  wait in the pool, and later requests use the record at once. The
+  route isn't proved first, carries no `Alt-Used`, and takes the
+  record's ECH configuration in place of ECH GREASE
+  (`CloneAndAdoptHTTPSSVCRecord`). A record that offers h3 sends the
+  request over HTTP/3, racing TCP after
+  `network.dns.httpssvc.http3_fast_fallback_timeout`, 50 ms; that TCP
+  connection goes to the best record without h3, which must have ECH if
+  the h3 one did, else to the origin, or nowhere if ECH was used and no
+  such record has it (`PrepareFastFallbackConnInfo`). Any other record
+  sends it over TCP to the record's target and port, with its ECH, and
+  a connection that doesn't agree on the ALPN the record names is
+  dropped (`nsHttpConnection`'s NPN token check). A connection from a
+  record that fails goes on as `PrepareConnInfoForRetry` does: without
+  ECH, to the origin; with it, again with the configurations a server
+  that rejected it sends back, or without ECH if it sent none, else to
+  the next record with ECH over TCP, to the origin only if some record
+  has none, and nowhere once they're all tried
+  (`network.dns.echconfig.fallback_to_origin_when_all_failed` is off). An
   http URL isn't upgraded to https from a record: with TRR off, Firefox
   doesn't (`nsHttpChannel::MaybeUseHTTPSRRForUpgrade`).
 - `h2` alternatives. Firefox takes those too, each one (`h2` on the
@@ -151,12 +174,14 @@ default preferences; Chrome's rules are
 - Proving it. As `AltSvcCache::UpdateAltServiceMapping` does, the
   fetcher connects to a new alternative at once, with no request, and
   only uses it once that connection is up with a certificate that checks
-  out. Requests meanwhile stay on TCP. The connection then carries the
-  origin's next requests, as Firefox's does. A header that repeats an
-  alternative already in use only renews its lifetime. One that names a
-  new alternative for an origin that has a proved one is proved the same
-  way, and the old one carries the origin's requests until it is: Firefox
-  stores the replacement only once it validates
+  out, and, for an `h2` one, has agreed on HTTP/2
+  (`AltSvcTransaction::MaybeValidate`); one that agreed on anything else
+  is closed. Requests meanwhile stay on TCP. The connection then
+  carries the origin's next requests, as Firefox's does. A header that
+  repeats an alternative already in use only renews its lifetime. One
+  that names a new alternative for an origin that has a proved one is
+  proved the same way, and the old one carries the origin's requests
+  until it is: Firefox stores the replacement only once it validates
   (`AltSvcMapping::SetSyncOnlyOnSuccess`). An alternative whose connection
   fails stays unproved and holds off another offer of it for two seconds
   (`AltSvcMappingValidator::OnTransactionDestroy`).
@@ -173,8 +198,10 @@ default preferences; Chrome's rules are
   connection is made or at once on one already open
   (`OnBackupConnectionReady`); HTTP/3 if its connection came up while the
   TCP one was still being made. Either way the other keeps going: the
-  HTTP/3 connection for the next requests, the TCP one to the end of its
-  TLS handshake.
+  HTTP/3 connection for the next requests, and the TCP one, a speculative
+  connection of its own (`CreateBackupConnection`), to send HTTP/2's
+  preface and wait in the pool. A TCP connection that fails leaves the
+  request to HTTP/3.
 - Failing. A connection that never comes up, for any reason but a TLS
   error, stops HTTP/3 to its alternative's host (`Http3Session::Shutdown`,
   `nsHttpHandler::ExcludeHttp3`). So does one that was up and closes with
@@ -208,26 +235,15 @@ as if proved, ignores Alt-Svc for it, and never races or falls back.
 
 What's not the same as Firefox:
 
-- HTTPS records that send TCP somewhere else (another port, or ECH over
-  TCP) aren't followed; those requests go to the origin. A record's h3
-  route is followed, ECH included.
-- The losing TCP connection of a fast fallback goes to the origin, where
-  Firefox takes the best record without h3 if there is one
-  (`PrepareFastFallbackConnInfo`); with the canonical-name check, that is
-  almost always the origin anyway.
-- The canonical name the record check needs comes from a lookup of its
-  own (getaddrinfo with `AI_CANONNAME`, as NSPR asks for Firefox),
-  alongside wreq's; a system with no caching resolver may send the
-  address queries twice. On Windows the check is skipped.
-- The race's losing TCP connection. When HTTP/3 wins, Firefox's backup
-  connection sends HTTP/2's preface and waits in the pool. Netweir's
-  finishes its TLS handshake and closes, as wreq can't keep a connection
-  it made for a request it no longer sends.
-- `h2` alternatives are proved by a TCP connection whose TLS handshake
-  and certificate check out; Firefox also insists the connection agreed
-  on HTTP/2, which wreq doesn't tell. And an origin whose URL has a port
-  can't have its HTTP/2 sent to another port, as wreq connects to the
-  port the URL gives, so such an alternative is ignored.
+- After a record's connection fails, Firefox may go on to a record
+  that offers h3 if HTTP/3 hasn't failed for the request yet; Netweir
+  goes on only to records over TCP. And an HTTP/3 connection whose ECH
+  the server rejects isn't tried again with the configurations it sends
+  back: the request goes on as after any other failure.
+- ECH over TCP: BoringSSL builds the inner and outer ClientHellos, where
+  Firefox has NSS, and Netweir hasn't compared the two.
+- The host cache, like the HTTPS records', is keyed by name alone;
+  Firefox keys both by the request's top-level site too.
 
 ## Chrome through netweir's quiche
 
@@ -408,6 +424,10 @@ Not the same as Chrome's:
   priority.
 - The time the addresses take is timed with `getaddrinfo`, and their TTL
   isn't known, so an answer with no records stands for a minute.
+- The TCP connection that loses a race to QUIC finishes its TLS
+  handshake and closes. Chrome's socket pool keeps it, idle
+  (`ClientSocketHandle::Reset` leaves its connect job running), and sends
+  HTTP/2's preface only once a request uses it, which wreq can't do.
 - An http:// URL whose host has an HTTPS record. Chrome sends a request
   for it to https:// with an internal 307 (`ERR_DNS_NAME_HTTPS_ONLY`);
   Netweir asks for the record and stays on http://.

@@ -1138,19 +1138,9 @@ tokio::task_local! {
 
 #[cfg(feature = "http3")]
 tokio::task_local! {
-    /// Set for a request racing an HTTP/3 connection: how far its TCP
-    /// connection has got, [`RACING`] or [`RACED`].
+    /// Set for a request racing an HTTP/3 connection with Chrome's rules:
+    /// how far its TCP connection has got, [`RACING`] or [`RACED`].
     static RACE: Arc<std::sync::atomic::AtomicU8>;
-}
-
-#[cfg(feature = "http3")]
-tokio::task_local! {
-    /// Set for a request to an `h2` alternative: the `host` and `port` its
-    /// connection goes to in place of the origin's.
-    static ALT: (String, u16);
-    /// Set for a connection made only to prove an `h2` alternative: told
-    /// it's up, it goes no further.
-    static PROVING: Arc<std::sync::atomic::AtomicBool>;
 }
 
 /// A racing request's TCP connection is being made.
@@ -1232,7 +1222,7 @@ where
     S: tower::Service<R>,
     S::Future: Send + 'static,
     S::Response: Send + 'static,
-    S::Error: Send + 'static + From<tokio::task::JoinError> + From<&'static str>,
+    S::Error: Send + 'static + From<tokio::task::JoinError>,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -1259,27 +1249,11 @@ where
         let mut telling = Telling(tell);
         let connecting = self.0.call(request);
         #[cfg(feature = "http3")]
-        if let Ok(proving) = PROVING.try_with(Arc::clone) {
-            // AltSvcTransaction: the TLS handshake, with a certificate for
-            // the origin, is the proof; no request follows.
-            // Known limit: whether it agreed on h2 isn't checked
-            // (MaybeValidate insists on it), as wreq keeps the ALPN result
-            // to itself.
-            return Box::pin(async move {
-                let made = connecting.await;
-                drop(telling);
-                if made.is_ok() {
-                    proving.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-                made.and(Err(S::Error::from("only proving an h2 alternative")))
-            });
-        }
-        #[cfg(feature = "http3")]
         if let Ok(race) = RACE.try_with(Arc::clone) {
             use std::sync::atomic::Ordering;
             race.store(RACING, Ordering::Relaxed);
             // Made to the end even if HTTP/3 wins and the request is
-            // dropped, as Firefox's backup connection is.
+            // dropped.
             let connecting = tokio::spawn(connecting);
             return Box::pin(async move {
                 let made = connecting.await.map_err(S::Error::from).and_then(|m| m);
@@ -1309,34 +1283,41 @@ where
 }
 
 /// The system's resolver, as wreq's own (getaddrinfo), but with the
-/// addresses `FetchOptions::resolve` gives, and for a request to an `h2`
-/// alternative the alternative's host and port in place of the origin's.
+/// addresses `FetchOptions::resolve` gives. A given address's port is
+/// used only where the URL (or the route a request connects to) names
+/// none.
 struct Resolver {
     hosts: Arc<HashMap<String, Vec<std::net::SocketAddr>>>,
+    /// Firefox's host cache, shared with the HTTPS records' canonical-name
+    /// check, for a Firefox profile that moves to HTTP/3.
+    #[cfg(feature = "http3")]
+    cache: Option<Arc<crate::https_rr::HostCache>>,
 }
 
 impl wreq::dns::Resolve for Resolver {
     fn resolve(&self, name: wreq::dns::Name) -> wreq::dns::Resolving {
-        #[cfg(feature = "http3")]
-        let routed = ALT.try_with(Clone::clone).ok();
-        #[cfg(not(feature = "http3"))]
-        let routed: Option<(String, u16)> = None;
-        let (name, port) = match routed {
-            Some((host, port)) => (wreq::dns::Name::new(host.into()), port),
-            None => (name, 0),
-        };
-        let with_port = move |mut a: std::net::SocketAddr| {
-            if port != 0 {
-                a.set_port(port);
-            }
-            a
-        };
         if let Some(given) = self.hosts.get(name.as_str()) {
-            let addrs: Vec<_> = given.iter().copied().map(with_port).collect();
+            let addrs = given.clone();
             return Box::pin(async move { Ok(Box::new(addrs.into_iter()) as wreq::dns::Addrs) });
         }
-        let resolving = wreq::dns::GaiResolver::default().resolve(name);
-        Box::pin(async move { Ok(Box::new(resolving.await?.map(with_port)) as wreq::dns::Addrs) })
+        #[cfg(feature = "http3")]
+        if let Some(cache) = self.cache.clone() {
+            return Box::pin(async move {
+                let found = cache.lookup(name.as_str()).await.ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("failed to look up address for {}", name.as_str()),
+                    )
+                })?;
+                let addrs: Vec<_> = found
+                    .ips
+                    .iter()
+                    .map(|ip| std::net::SocketAddr::new(*ip, 0))
+                    .collect();
+                Ok(Box::new(addrs.into_iter()) as wreq::dns::Addrs)
+            });
+        }
+        wreq::dns::GaiResolver::default().resolve(name)
     }
 }
 
@@ -1384,6 +1365,17 @@ impl Fetcher {
                 .push(*addr);
         }
         let hosts = Arc::new(hosts);
+        // Firefox's host cache, for a Firefox profile that moves to HTTP/3,
+        // where the HTTPS records' canonical-name check would otherwise
+        // look each name up a second time.
+        #[cfg(feature = "http3")]
+        let host_cache = (options.http3
+            && options.proxy.is_none()
+            && profile
+                .http3
+                .as_ref()
+                .is_some_and(|h| h.stack == "firefox-160"))
+        .then(|| Arc::new(crate::https_rr::HostCache::default()));
         let build = |emulation| -> Result<wreq::Client, FetchError> {
             let mut builder = wreq::Client::builder()
                 .emulation(emulation)
@@ -1411,6 +1403,8 @@ impl Fetcher {
             }
             builder = builder.connector_layer(Told).dns_resolver(Resolver {
                 hosts: hosts.clone(),
+                #[cfg(feature = "http3")]
+                cache: host_cache.clone(),
             });
             if options.proxy.is_none() && !options.system_proxy {
                 builder = builder.no_proxy();
@@ -1515,6 +1509,7 @@ impl Fetcher {
                         (!options.https_records.is_empty())
                             .then(|| Arc::new(options.https_records.clone())),
                         stack,
+                        host_cache.clone(),
                     )))
                 }
                 Some(other) => {
@@ -2228,7 +2223,7 @@ impl Fetcher {
     async fn send_h3(
         &self,
         (routes, way): Route,
-        mut request: wreq::RequestBuilder,
+        request: wreq::RequestBuilder,
         order: OrigHeaderMap,
         sent: Option<&Sent>,
         view: Option<JarView>,
@@ -2260,31 +2255,39 @@ impl Fetcher {
             }
             Way::Lookup(lookup) => {
                 // The TCP connection starts now; records that come in while
-                // it's being made, and send the request over HTTP/3, take it.
-                let Some(racing) = request.try_clone() else {
+                // it's being made, and send the request over HTTP/3, take it
+                // (nsHttpTransaction::OnHTTPSRRAvailable). The connection
+                // goes on to wait in the pool, as Firefox's half-open one
+                // does once no transaction is left for it
+                // (DnsAndConnectSocket::SetupConn).
+                let Some(mut connecting) = preconnect(&request, None) else {
                     return dispatch(request, order, sent, view).await;
                 };
-                let state = Arc::new(std::sync::atomic::AtomicU8::new(0));
-                let over_tcp = RACE.scope(
-                    state.clone(),
-                    dispatch(request, order.clone(), sent, view.clone()),
-                );
-                tokio::pin!(over_tcp);
                 let adopted = tokio::select! {
                     biased;
-                    done = &mut over_tcp => return done,
+                    made = &mut connecting => match made {
+                        Ok(Err(e)) => return Err(e.into()),
+                        _ => return dispatch(request, order, sent, view).await,
+                    },
                     route = routes.adopt_when_found(lookup) => route,
                 };
                 match adopted {
-                    Some(route) if state.load(std::sync::atomic::Ordering::Relaxed) == RACING => {
-                        request = racing;
-                        route
+                    Some(route) if !connecting.is_finished() => route,
+                    _ => {
+                        if let Ok(Err(e)) = connecting.await {
+                            return Err(e.into());
+                        }
+                        return dispatch(request, order, sent, view).await;
                     }
-                    _ => return over_tcp.await,
                 }
             }
         };
         if !route.h3 {
+            if let Some(from) = route.from.clone()
+                && let Some(tcp) = from.tcp.clone()
+            {
+                return send_from_records(&from, Next::To(tcp), request, order, sent, view).await;
+            }
             return send_h2(route, request, order, sent, view).await;
         }
         let tcp = request.try_clone();
@@ -2377,12 +2380,16 @@ impl Fetcher {
             )
         })??;
         let answer = match answer {
-            crate::h3::Answer::Race(mut pending) => {
-                // A TCP connection is opened now, as Firefox's backup timer
-                // opens one, and the request goes to whichever is up first:
-                // over TCP once its connection is made (or at once, on one
-                // already open), over HTTP/3 if that came up while it was
-                // still being made.
+            crate::h3::Answer::Race(mut pending) if routes.is_chrome() => {
+                // A TCP connection is opened now, and the request goes to
+                // whichever is up first: over TCP once its connection is
+                // made (or at once, on one already open), over HTTP/3 if
+                // that came up while it was still being made.
+                // Known limit: one that loses finishes its TLS handshake and
+                // closes. Chrome's socket pool keeps it idle
+                // (ClientSocketHandle::Reset leaves its connect job running),
+                // with no HTTP/2 preface until a request uses it, which
+                // wreq can't do.
                 let state = Arc::new(std::sync::atomic::AtomicU8::new(0));
                 let won = match tcp.as_ref().and_then(wreq::RequestBuilder::try_clone) {
                     Some(racing) => {
@@ -2417,21 +2424,84 @@ impl Fetcher {
                 if won && let (Some(sent), Some(lines)) = (sent, recorded) {
                     *sent.lock().unwrap_or_else(|e| e.into_inner()) = lines;
                 }
-                let request = pending.request();
-                match tokio::time::timeout_at(
+                h3_answer(
+                    routes.send(&route, &host, pending.request(), deadline, h3.idempotent),
                     deadline,
-                    routes.send(&route, &host, request, deadline, h3.idempotent),
+                    &uri,
                 )
                 .await
+            }
+            crate::h3::Answer::Race(mut pending) => {
+                // A TCP connection is opened now, as Firefox's backup timer
+                // opens one (nsHttpTransaction::OnHttp3BackupTimer, a
+                // FallbackTransaction), and the request goes to whichever is
+                // up first: over TCP once its connection is made (or at
+                // once, on one already open), over HTTP/3 if that came up
+                // while it was still being made. A TCP connection that
+                // fails leaves the request to HTTP/3 (OnBackupConnectionReady
+                // hears only of success). One that loses waits in the pool
+                // for the next request, as Firefox's does.
+                // From an HTTPS record, the backup goes where
+                // PrepareFastFallbackConnInfo sends it, or nowhere.
+                let ech_used = route.record.as_ref().is_some_and(Option::is_some);
+                let fallback = match route.from.as_ref().map(|f| f.fast_fallback(ech_used)) {
+                    None | Some(Some(None)) => tcp
+                        .as_ref()
+                        .and_then(wreq::RequestBuilder::try_clone)
+                        .map(|r| (r, None)),
+                    Some(Some(Some(to))) => tcp
+                        .as_ref()
+                        .and_then(wreq::RequestBuilder::try_clone)
+                        .and_then(|r| to_record(r, &to)),
+                    Some(None) => None,
+                };
+                let mut backup = fallback
+                    .as_ref()
+                    .and_then(|(r, require)| preconnect(r, *require));
+                let won = loop {
+                    let Some(connecting) = backup.as_mut() else {
+                        break pending.up().await;
+                    };
+                    tokio::select! {
+                        biased;
+                        made = connecting => match made {
+                            Ok(Ok(v)) if fallback.as_ref().and_then(|f| f.1).is_none_or(|r| r == v) => {
+                                let (tcp, _) = fallback.expect("a backup is made from it");
+                                let done = dispatch(tcp, order, sent, view).await;
+                                if done.is_ok() {
+                                    routes.tcp_answered(&route, &host);
+                                }
+                                return done;
+                            }
+                            _ => backup = None,
+                        },
+                        up = pending.up() => break up,
+                    }
+                };
+                if !won
+                    && route.from.is_none()
+                    && let Some(tcp) = tcp
                 {
-                    Ok(Ok(crate::h3::Answer::Response(answer))) => Ok(answer),
-                    Ok(Ok(_)) => Err(None),
-                    Ok(Err(e)) => Err(Some(e)),
-                    Err(_) => Err(Some(FetchError::new(
-                        FetchErrorKind::Timeout,
-                        format!("{uri}: no answer over HTTP/3 in time"),
-                    ))),
+                    // So the request rides the backup's connection rather
+                    // than opening another beside it.
+                    if let Some(connecting) = backup {
+                        let _ = connecting.await;
+                    }
+                    let done = dispatch(tcp, order, sent, view).await;
+                    if done.is_ok() {
+                        routes.tcp_answered(&route, &host);
+                    }
+                    return done;
                 }
+                if won && let (Some(sent), Some(lines)) = (sent, recorded) {
+                    *sent.lock().unwrap_or_else(|e| e.into_inner()) = lines;
+                }
+                h3_answer(
+                    routes.send(&route, &host, pending.request(), deadline, h3.idempotent),
+                    deadline,
+                    &uri,
+                )
+                .await
             }
             crate::h3::Answer::Response(answer) => Ok(answer),
             crate::h3::Answer::Tcp => Err(None),
@@ -2439,6 +2509,29 @@ impl Fetcher {
         let answer = match (answer, tcp) {
             (Ok(answer), _) => answer,
             (Err(Some(e)), _) => return Err(e),
+            (Err(None), Some(tcp)) if let Some(from) = route.from.as_ref() => {
+                // An HTTP/3 connection from a record failed: on as
+                // PrepareConnInfoForRetry goes.
+                let (host, port) = route
+                    .alternative
+                    .rsplit_once(':')
+                    .map_or((route.alternative.as_str(), ""), |(h, p)| (h, p));
+                let failed = crate::https_rr::Route {
+                    host: host.to_string(),
+                    port: port.parse().unwrap_or(0),
+                    alpn: "h3".into(),
+                    ech: route.record.clone().flatten(),
+                };
+                let next = Next::After(
+                    failed,
+                    None,
+                    FetchError::new(
+                        FetchErrorKind::Connect,
+                        format!("{uri}: HTTP/3 failed, and no other record is left"),
+                    ),
+                );
+                return send_from_records(from, next, tcp, order, sent, view).await;
+            }
             (Err(None), Some(tcp)) => {
                 let done = dispatch(tcp, order, sent, view).await;
                 if done.is_ok() {
@@ -2460,11 +2553,193 @@ impl Fetcher {
     }
 }
 
-/// Sends a request to an `h2` alternative: over TCP to its host and port,
-/// for the origin (its server name, certificate and `:authority`), with
-/// `Alt-Used` (nsHttpChannel::BeginConnect) where Connection would be, as
-/// over HTTP/3. Its connections are pooled apart from the origin's, as
-/// Firefox's routed connection info hashes apart.
+/// A raced request's answer over HTTP/3, sent once its connection is up:
+/// None if it goes over TCP after all.
+#[cfg(feature = "http3")]
+async fn h3_answer(
+    sending: impl std::future::Future<Output = Result<crate::h3::Answer, FetchError>>,
+    deadline: tokio::time::Instant,
+    uri: &Uri,
+) -> Result<http::Response<crate::h3::Body>, Option<FetchError>> {
+    match tokio::time::timeout_at(deadline, sending).await {
+        Ok(Ok(crate::h3::Answer::Response(answer))) => Ok(answer),
+        Ok(Ok(_)) => Err(None),
+        Ok(Err(e)) => Err(Some(e)),
+        Err(_) => Err(Some(FetchError::new(
+            FetchErrorKind::Timeout,
+            format!("{uri}: no answer over HTTP/3 in time"),
+        ))),
+    }
+}
+
+/// `request` over a TCP connection to `to` (`host:port`) in place of its
+/// URL's host and port, for the URL's origin all the same (its server
+/// name, certificate and `:authority`). Such connections are pooled apart
+/// from the origin's, as Firefox's routed connection info hashes apart.
+#[cfg(feature = "http3")]
+fn routed(request: wreq::RequestBuilder, to: &str) -> Option<wreq::RequestBuilder> {
+    Some(request.connect_to(to.parse().ok()?))
+}
+
+/// Makes the TCP connection `request` would go over, in the background,
+/// and leaves it idle in the pool, without sending `request`: Firefox's
+/// backup and fallback connections (CreateBackupConnection, a speculative
+/// transaction), which once made wait for the next request even if HTTP/3
+/// carried this one. For HTTP/2 that's after its preface and SETTINGS.
+/// Done once the connection is up, with the version it agreed on, or has
+/// failed. With `require`, one that agreed on another is closed.
+#[cfg(feature = "http3")]
+fn preconnect(
+    request: &wreq::RequestBuilder,
+    require: Option<Version>,
+) -> Option<tokio::task::JoinHandle<Result<Version, wreq::Error>>> {
+    let request = request.try_clone()?.connect_only(require);
+    let connecting = async move { request.send().await.map(|made| made.version()) };
+    // A crawl hears of it as of its request's own connection.
+    Some(match TOLD.try_with(Arc::clone) {
+        Ok(tell) => tokio::spawn(TOLD.scope(tell, connecting)),
+        Err(_) => tokio::spawn(connecting),
+    })
+}
+
+/// `request` over TCP to an HTTPS record's route `to`: its target and
+/// port, with its ECH configuration, and the version its ALPN names, if
+/// it names one, which the connection has to agree on (nsHttpConnection
+/// closes one whose ALPN isn't the record's NPN token).
+#[cfg(feature = "http3")]
+fn to_record(
+    request: wreq::RequestBuilder,
+    to: &crate::https_rr::Route,
+) -> Option<(wreq::RequestBuilder, Option<Version>)> {
+    let mut request = routed(request, &format!("{}:{}", to.host, to.port))?;
+    if let Some(ech) = &to.ech {
+        request = request.ech_config_list(ech.clone());
+    }
+    let require = match to.alpn.as_str() {
+        "h2" => Some(Version::HTTP_2),
+        "http/1.1" => Some(Version::HTTP_11),
+        _ => None,
+    };
+    Some((request, require))
+}
+
+/// Where a request from HTTPS records goes next over TCP.
+#[cfg(feature = "http3")]
+enum Next {
+    /// To this record's route.
+    To(crate::https_rr::Route),
+    /// On from this route's failed connection, which the server rejected
+    /// ECH on (with configurations to retry with, if any) or not, and the
+    /// error to give if nowhere is left.
+    After(crate::https_rr::Route, Option<Option<Vec<u8>>>, FetchError),
+}
+
+/// Sends `request`, whose route came from HTTPS records `from`, over TCP
+/// as `next` says, and when a connection fails goes on as Firefox's
+/// nsHttpTransaction::PrepareConnInfoForRetry does: without ECH, to the
+/// origin; with it, again with the configurations a server that rejected
+/// it sent, or without them if it sent none, else to the next record with
+/// ECH, and to the origin only if some record has none
+/// (network.dns.echconfig.fallback_to_origin_when_all_failed is false).
+/// At most network.http.request.max-attempts (10) connections.
+#[cfg(feature = "http3")]
+async fn send_from_records(
+    from: &crate::h3::FromRecords,
+    mut next: Next,
+    request: wreq::RequestBuilder,
+    order: OrigHeaderMap,
+    sent: Option<&Sent>,
+    view: Option<JarView>,
+) -> Result<wreq::Response, FetchError> {
+    let mut retries: Option<Vec<crate::https_rr::Route>> = None;
+    for _ in 0..10 {
+        let to = match next {
+            Next::To(to) => to,
+            Next::After(failed, rejected, error) => {
+                if failed.ech.is_none() {
+                    return dispatch(request, order, sent, view).await;
+                }
+                match rejected {
+                    Some(Some(configs)) => crate::https_rr::Route {
+                        ech: Some(configs),
+                        ..failed
+                    },
+                    Some(None) => crate::https_rr::Route {
+                        ech: None,
+                        ..failed
+                    },
+                    None => {
+                        let list = match &mut retries {
+                            Some(list) => list,
+                            None => {
+                                let (all, list) = from.retries(&failed);
+                                if !all {
+                                    return dispatch(request, order, sent, view).await;
+                                }
+                                retries.insert(list)
+                            }
+                        };
+                        if list.is_empty() {
+                            return Err(error);
+                        }
+                        list.remove(0)
+                    }
+                }
+            }
+        };
+        let Some((routed, require)) = request.try_clone().and_then(|r| to_record(r, &to)) else {
+            return dispatch(request, order, sent, view).await;
+        };
+        // The connection first, so a failed one can go on elsewhere.
+        let connecting = routed.try_clone().map(|r| r.connect_only(require).send());
+        let made = match connecting {
+            Some(connecting) => connecting.await,
+            None => return dispatch(routed, order, sent, view).await,
+        };
+        next = match made {
+            Ok(made) if require.is_none_or(|v| v == made.version()) => {
+                return dispatch(routed, order, sent, view).await;
+            }
+            Ok(_) => Next::After(
+                to,
+                None,
+                FetchError::new(
+                    FetchErrorKind::Connect,
+                    "the connection agreed on another protocol than its HTTPS record's",
+                ),
+            ),
+            Err(e) => {
+                let rejected = ech_rejected(&e);
+                Next::After(to, rejected, e.into())
+            }
+        };
+    }
+    match next {
+        Next::After(_, _, error) => Err(error),
+        Next::To(_) => Err(FetchError::new(
+            FetchErrorKind::Connect,
+            "too many attempts",
+        )),
+    }
+}
+
+/// Whether a connection failed because the server rejected ECH, and the
+/// configurations it sent to retry with, if any.
+#[cfg(feature = "http3")]
+fn ech_rejected(error: &wreq::Error) -> Option<Option<Vec<u8>>> {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(e) = source {
+        if let Some(rejected) = e.downcast_ref::<wreq::tls::EchRejected>() {
+            return Some(rejected.retry_configs().map(<[u8]>::to_vec));
+        }
+        source = e.source();
+    }
+    None
+}
+
+/// Sends a request to an `h2` alternative: over TCP to its host and port
+/// (see [`routed`]), with `Alt-Used` (nsHttpChannel::BeginConnect) where
+/// Connection would be, as over HTTP/3.
 #[cfg(feature = "http3")]
 async fn send_h2(
     route: crate::h3::Route,
@@ -2473,16 +2748,15 @@ async fn send_h2(
     sent: Option<&Sent>,
     view: Option<JarView>,
 ) -> Result<wreq::Response, FetchError> {
-    let Some((host, port)) = route
-        .alternative
-        .rsplit_once(':')
-        .and_then(|(h, p)| Some((h.to_string(), p.parse::<u16>().ok()?)))
+    let Some(request) = request
+        .try_clone()
+        .and_then(|r| routed(r, &route.alternative))
     else {
         return dispatch(request, order, sent, view).await;
     };
-    let alt_used = match port {
-        443 => host.clone(),
-        _ => route.alternative.clone(),
+    let alt_used = match route.alternative.strip_suffix(":443") {
+        Some(host) => host.to_string(),
+        None => route.alternative.clone(),
     };
     let mut placed = OrigHeaderMap::new();
     let mut put = false;
@@ -2496,34 +2770,21 @@ async fn send_h2(
     if !put {
         placed.insert("alt-used");
     }
-    let request = request
-        .header("alt-used", alt_used)
-        .group(wreq::Group::new(format!("alt-svc {}", route.alternative)));
-    ALT.scope((host, port), dispatch(request, placed, sent, view))
-        .await
+    dispatch(request.header("alt-used", alt_used), placed, sent, view).await
 }
 
 /// Proves an `h2` alternative `to` for `origin` with `client`'s TCP
-/// connections: a connection of its own (its own pool group, so none is
-/// shared), made and then dropped.
+/// connections, as Firefox's AltSvcTransaction does: a connection to it
+/// with no request, which has to agree on HTTP/2 with a certificate for
+/// the origin (MaybeValidate). It then waits in the pool for the origin's
+/// requests; one that agreed on anything else is closed (DontReuse).
 #[cfg(feature = "http3")]
 async fn prove_h2(client: wreq::Client, origin: Url, to: String) -> bool {
-    static PROOFS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let Some((host, port)) = to
-        .rsplit_once(':')
-        .and_then(|(h, p)| Some((h.to_string(), p.parse::<u16>().ok()?)))
-    else {
+    let Some(request) = routed(client.get(origin.as_str()), &to) else {
         return false;
     };
-    let n = PROOFS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let request = client
-        .get(origin.as_str())
-        .group(wreq::Group::new(format!("alt-svc proof {n}")));
-    let proved = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let _ = PROVING
-        .scope(proved.clone(), ALT.scope((host, port), request.send()))
-        .await;
-    proved.load(std::sync::atomic::Ordering::Relaxed)
+    let proof = request.connect_only(Some(Version::HTTP_2)).send().await;
+    proof.is_ok_and(|r| r.version() == Version::HTTP_2)
 }
 
 /// What a request over HTTP/3 needs besides what wreq's request holds.
@@ -2801,6 +3062,25 @@ mod tests {
 
     fn fetcher() -> Fetcher {
         Fetcher::new(FetchOptions::new(Profile::named("chrome").unwrap())).unwrap()
+    }
+
+    #[cfg(feature = "http3")]
+    #[tokio::test]
+    async fn the_record_check_and_the_connection_look_a_name_up_once() {
+        // Firefox's canonical-name check and its TCP connection share one
+        // host cache entry (network.dns.always_ai_canonname), so one
+        // getaddrinfo serves both, and the next request's too.
+        let server = netweir_fingerprint::Server::start().await.unwrap();
+        let mut options = FetchOptions::new(Profile::named("firefox-160-macos").unwrap());
+        options.verify_certificates = false;
+        let fetcher = Fetcher::new(options).unwrap();
+        let url = format!("https://localhost:{}/", server.port);
+        fetcher.get(&url, &[]).await.unwrap();
+        fetcher.get(&url, &[]).await.unwrap();
+        let routes = fetcher.h3.as_ref().unwrap();
+        // The record lookup's task may still be on its way.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(routes.address_lookups(), 1);
     }
 
     #[test]

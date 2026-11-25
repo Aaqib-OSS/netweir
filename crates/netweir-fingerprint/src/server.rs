@@ -122,26 +122,41 @@ impl Server {
         Server::bind_with(port, alpn, None, false).await
     }
 
-    /// A TCP listener on `port`, or on a free port for 0. With `h3` the
-    /// same port must also be free for UDP, which on Windows a free TCP
-    /// port often isn't: the system reserves ranges of UDP ports, and
-    /// binding one fails with WSAEACCES. So port 0 tries again.
-    async fn listen(port: u16, h3: bool) -> io::Result<(TcpListener, u16)> {
-        let mut tries = 0;
-        loop {
+    /// A TCP listener on `port`, or on a free port for 0. With `h3`, a
+    /// UDP socket on the same port too, kept and returned for QUIC:
+    /// freed, another socket could take its port first. For port 0 the
+    /// number is picked at random. Windows gives out TCP and UDP ports
+    /// one after another, each blind to the other's reserved ranges, so
+    /// in CI 51 picks in a row from either one were taken or reserved
+    /// for the other.
+    async fn listen(
+        port: u16,
+        h3: bool,
+    ) -> io::Result<(TcpListener, u16, Option<std::net::UdpSocket>)> {
+        if !h3 {
             let listener = TcpListener::bind(("127.0.0.1", port)).await?;
             let got = listener.local_addr()?.port();
-            if !h3 {
-                return Ok((listener, got));
-            }
-            match std::net::UdpSocket::bind(("127.0.0.1", got)) {
-                // Free for UDP too; listen_quic binds it for real.
-                Ok(probe) => {
-                    drop(probe);
-                    return Ok((listener, got));
+            return Ok((listener, got, None));
+        }
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            let got = if port == 0 { random_port() } else { port };
+            let both = match std::net::UdpSocket::bind(("127.0.0.1", got)) {
+                Ok(udp) => TcpListener::bind(("127.0.0.1", got))
+                    .await
+                    .map(|listener| (listener, udp)),
+                Err(e) => Err(e),
+            };
+            match both {
+                Ok((listener, udp)) => return Ok((listener, got, Some(udp))),
+                Err(e) if port != 0 || tries == 100 => {
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!("port {got}, try {tries}: {e}"),
+                    ));
                 }
-                Err(e) if port != 0 || tries == 50 => return Err(e),
-                Err(_) => tries += 1,
+                Err(_) => {}
             }
         }
     }
@@ -152,7 +167,7 @@ impl Server {
         certificate: Option<(Vec<u8>, Vec<u8>)>,
         h3: bool,
     ) -> io::Result<Server> {
-        let (listener, port) = Server::listen(port, h3).await?;
+        let (listener, port, udp) = Server::listen(port, h3).await?;
         let certificate = certificate.unwrap_or_else(|| {
             let names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
             let made = rcgen::generate_simple_self_signed(names).expect("self-signed cert");
@@ -160,15 +175,16 @@ impl Server {
         });
         let (tx, captures) = mpsc::unbounded_channel();
         let connections = Arc::new(AtomicU64::new(0));
-        let alt_svc = if h3 {
+        let alt_svc = if let Some(v4) = udp {
             let config = tls_config(&[b"h3"], certificate.clone());
-            let v4 = SocketAddr::from(([127, 0, 0, 1], port));
             listen_quic(v4, config.clone(), connections.clone(), tx.clone())?;
             // Chrome sends QUIC for `localhost` to ::1 and doesn't fall
             // back to 127.0.0.1 as it does over TCP. A machine without
             // IPv6 just doesn't get this one.
             let v6 = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port));
-            let _ = listen_quic(v6, config, connections.clone(), tx.clone());
+            if let Ok(v6) = std::net::UdpSocket::bind(v6) {
+                let _ = listen_quic(v6, config, connections.clone(), tx.clone());
+            }
             Some(format!("h3=\":{port}\"; ma=86400"))
         } else {
             None
@@ -193,6 +209,12 @@ impl Server {
     pub async fn next(&mut self) -> Option<Capture> {
         self.captures.recv().await
     }
+}
+
+/// A port in the dynamic range, 49152 to 65535.
+fn random_port() -> u16 {
+    use std::hash::{BuildHasher, RandomState};
+    49152 + (RandomState::new().hash_one(()) % 16384) as u16
 }
 
 /// A certificate for `localhost` and `127.0.0.1` kept in `dir`, made the
@@ -461,7 +483,7 @@ impl quinn::AsyncUdpSocket for Tee {
 /// what the socket received, and its HTTP/3 requests are answered as the
 /// TCP side answers them.
 fn listen_quic(
-    addr: SocketAddr,
+    udp: std::net::UdpSocket,
     tls: rustls::ServerConfig,
     connections: Arc<AtomicU64>,
     tx: mpsc::UnboundedSender<Capture>,
@@ -472,7 +494,7 @@ fn listen_quic(
     let runtime = Arc::new(quinn::TokioRuntime);
     let seen = Seen::default();
     let socket = Arc::new(Tee {
-        inner: quinn::Runtime::wrap_udp_socket(&*runtime, std::net::UdpSocket::bind(addr)?)?,
+        inner: quinn::Runtime::wrap_udp_socket(&*runtime, udp)?,
         seen: seen.clone(),
     });
     let endpoint = quinn::Endpoint::new_with_abstract_socket(

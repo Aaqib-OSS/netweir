@@ -147,7 +147,36 @@ default preferences; Chrome's rules are
   wait in the pool, and later requests use the record at once. The
   route isn't proved first, carries no `Alt-Used`, and takes the
   record's ECH configuration in place of ECH GREASE
-  (`CloneAndAdoptHTTPSSVCRecord`). A record that offers h3 sends the
+  (`CloneAndAdoptHTTPSSVCRecord`). Over TCP, BoringSSL builds both
+  ClientHellos where Firefox has NSS, so `ech_inner_like_nss` in the
+  profile makes it write the ClientHelloInner as NSS does
+  (`SSL_CTX_set_ech_inner_like_nss`, in netweir/btls): the
+  `encrypted_client_hello` marker first, then `server_name` and
+  `supported_versions`, the ClientHelloOuter's cipher suites, TLS 1.2
+  ones included, and every other extension, `delegated_credentials` and
+  `record_size_limit` among them, in `ech_outer_extensions` in the outer
+  hello's order. NSS takes a configuration's first cipher suite, and so
+  does BoringSSL once `aes_hw_override` tells it the machine has AES
+  hardware; without that, BoringSSL prefers ChaCha20-Poly1305 on a
+  machine without it. The same option makes ECH GREASE NSS's
+  (`tls13_MaybeGreaseEch`): AES-128-GCM or ChaCha20-Poly1305 drawn at
+  random for each connection, where BoringSSL takes AES-128-GCM on any
+  machine with AES hardware, and a payload as long as the
+  EncodedClientHelloInner would be, padded for a `maximum_name_length`
+  of 100, where BoringSSL draws one of four lengths. The padding counts
+  the host's name even for an IP address, which gets ECH GREASE but no
+  `server_name`, and a second ClientHello after a HelloRetryRequest
+  repeats the first one's ECH GREASE.
+  `profiles/firefox-160-macos.ech.capture.json` recorded Firefox
+  160.0.1's outer and inner ClientHellos, decrypted with a key
+  `examples/ech_capture.rs` holds, for `maximum_name_length` 0 and 64
+  and for cipher suites with ChaCha20-Poly1305 first and last, and its
+  ECH GREASE for a short and a long host name and an IP address. `tests/ech_tcp.rs` holds
+  Netweir's to them: the same bytes but the randoms, key shares and
+  encrypted payload, padding included. It also checks every Firefox
+  profile's ECH GREASE, and finishes handshakes with a BoringSSL server
+  that holds the key, ECH accepted, after a HelloRetryRequest too. A
+  record that offers h3 sends the
   request over HTTP/3, racing TCP after
   `network.dns.httpssvc.http3_fast_fallback_timeout`, 50 ms; that TCP
   connection goes to the best record without h3, which must have ECH if
@@ -256,8 +285,9 @@ as if proved, ignores Alt-Svc for it, and never races or falls back.
 
 What's not the same as Firefox:
 
-- ECH over TCP: BoringSSL builds the inner and outer ClientHellos, where
-  Firefox has NSS, and Netweir hasn't compared the two.
+- ECH over TCP is held to recordings of configurations without
+  extensions of their own; how NSS and BoringSSL treat a configuration
+  extension isn't compared.
 - The host cache, like the HTTPS records', is keyed by name alone;
   Firefox keys both by the request's top-level site too.
 

@@ -483,9 +483,10 @@ next requests leave on neqo, the QUIC stack Firefox itself runs, set up
 with Firefox 161's settings, and a test holds the QUIC Initial, the
 ClientHello inside it and the HTTP/3 settings to a recording of the real
 browser. A site's ECH key is used the way Firefox uses it, retries and
-all. A connection that resumes sends a GET in 0-RTT, as Firefox 160 did;
-Firefox 161 was recorded waiting for the handshake instead, which Netweir
-doesn't follow yet. That, and the rest of what isn't Firefox's, is in
+all. A connection that resumes in 0-RTT sends the request it was made for
+once its handshake is done, as Firefox 160 and 161 do since Mozilla's
+`happy-eyeballs-release-rollout` turned Happy Eyeballs on for release
+Firefox (from 28 September 2026). What isn't Firefox's is in
 [docs/design/http3.md](docs/design/http3.md#what-doesnt-match-yet). With a
 proxy it stays on TCP, as Firefox does, and `http3=False` turns it
 off.

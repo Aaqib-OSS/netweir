@@ -85,8 +85,14 @@ Exactly as Firefox sends them, on every run:
   `/again`. Firefox sent that GET in 0-RTT on the connection that
   resumed, in its first flight: the 0-RTT packet coalesced after the
   second Initial, filling that datagram. Netweir's first flight has the
-  same packets in the same datagrams, and the request comes in 0-RTT.
-  Firefox 161 doesn't do this; see below.
+  same packets in the same datagrams, and the request comes in 0-RTT,
+  with `happy_eyeballs` off as that profile was (see 0-RTT below).
+  `profiles/firefox-161-macos.h3-0rtt.capture.json` recorded Firefox
+  161.0 on the same page, seven times, twice with each datagram held back
+  50 ms: its first flight's 0-RTT packet, about 110 bytes, carries only
+  the control and QPACK streams, and `/again` goes once the handshake is
+  done. Netweir's `firefox-161` first flight has the same packets in the
+  same datagrams, and the request comes after the handshake.
 
 Random per connection, and checked to fall where Firefox's do: the
 Destination Connection ID (8 to 20 bytes), the first packet number (under
@@ -100,19 +106,12 @@ loop driving neqo, which is Netweir's and not Firefox's socket thread.
 
 ## What doesn't match yet
 
-- 0-RTT on Firefox 161. Recorded on `/zero-rtt` seven times, twice with
-  each datagram to Firefox held back 50 ms, Firefox 161.0 on macOS
-  resumed with early data allowed and still sent `/again` only once the
-  handshake was done. Its first flight carries a 0-RTT packet of about
-  110 bytes, its control and QPACK streams, with zeros after it
-  (`profiles/firefox-161-macos.h3-0rtt.capture.json`, `.h3-0rtt-qpack`).
-  Firefox 160 put the GET in that packet. Netweir runs the neqo Firefox
-  161 pins with 161's settings and still sends the GET in 0-RTT, as 160
-  did, so the change is in Gecko, and nothing in 161's `Http3Session`,
-  `nsHttpTransaction`, `neqo_glue` or preferences that touches 0-RTT
-  differs from 160's. Until it is found, Firefox profiles send a resumed
-  connection's GET in 0-RTT, and the 0-RTT tests hold them to Firefox
-  160's recordings.
+- Happy Eyeballs. Firefox's race of addresses and protocols
+  (HappyEyeballsConnectionAttempt), on in release through Mozilla's
+  rollout, isn't ported. Firefox profiles send QUIC to the first address
+  and race TCP on the backup timer, as Firefox did before it. Only what
+  the race does to a resumed connection's first request is followed (see
+  0-RTT below).
 
 - Images. Firefox gives an image Priority `u=4, i` or `u=5, i` depending on
   the page's layout; the profile sends `u=4, i`, as Firefox did over TCP.
@@ -385,6 +384,23 @@ Firefox's, as Netweir follows it:
   nsHttpRequestHead::IsSafeMethod) goes in 0-RTT; any other waits for
   the handshake (Http3Session's mCannotDo0RTTStreams). The request the
   connection was made for goes in its first flight.
+- Under Happy Eyeballs (`network.http.happy_eyeballs_enabled`, `[http3]
+  happy_eyeballs` in a profile), that request waits for the handshake.
+  The pref's default is Nightly only, but Mozilla's Nimbus rollout
+  `happy-eyeballs-release-rollout` turns it on for every release Firefox
+  from 157 on. A page's channel connects speculatively before its cache
+  lookup (nsHttpChannel::SpeculativeConnect), so the attempt makes the
+  connection for a HappyEyeballsTransaction with no request yet. That
+  transaction turns 0-RTT down (ZeroRttHandle::Do0RTT has no real
+  transaction), so the first flight's 0-RTT packet has only the control
+  and QPACK streams. The request then claims the attempt
+  (HappyEyeballsConnectionAttempt::Claim) and is dispatched once the
+  connection is up. Requests taken after it still go in 0-RTT.
+  The rollout's recipe starts on 2026-09-28 and targets every release
+  Firefox from 157 at 100%, so `firefox-160` and `firefox-161` both set
+  it. Firefox 160.0.1's `h3-0rtt` recordings were made with a profile the
+  rollout hadn't reached, and sent the request in 0-RTT; the tests that
+  hold Netweir to them build the profile with `happy_eyeballs` off.
 - It keeps the backup timer: if the handshake isn't done when that
   fires, TCP races the request as for a connection still being made
   (MaybeStartHttp3BackupTimer; Finish0RTT cancels it).
